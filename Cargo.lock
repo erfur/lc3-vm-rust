@@ -1,0 +1,4 @@
+[[package]]
+name = "lc3-vm-rust"
+version = "0.1.0"
+
