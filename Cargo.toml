@@ -5,3 +5,4 @@ authors = ["erfur <erfur@itu.edu.tr>"]
 edition = "2018"
 
 [dependencies]
+termios = "0.3.1"
