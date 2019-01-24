@@ -5,11 +5,11 @@ use std::env;
 use std::io::Read;
 // use std::error::Error;
 use std::fs::File;
-use std::fs;
+// use std::fs;
 // use std::io::prelude::*;
 use std::path::Path;
-use std::io;
-use std::os::unix::io::RawFd;
+// use std::io;
+// use std::os::unix::io::RawFd;
 use termios::*;
 
 enum Registers {
