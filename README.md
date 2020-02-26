@@ -24,6 +24,6 @@ $ cargo run --release sample_apps/rogue.obj
 
 # References
 
-The reference C code was taken from this project: 
+[1] https://justinmeiners.github.io/lc3-vm/index.html - Tutorial and reference C code
 
-https://justinmeiners.github.io/lc3-vm/index.html
+[2] https://onur.github.io/chip8/ - Building a CHIP-8 emulator with Rust
