@@ -1,16 +1,14 @@
 extern crate termios;
 
-// use std;
 use std::env;
-use std::io::Read;
-// use std::error::Error;
 use std::fs::File;
-// use std::fs;
-// use std::io::prelude::*;
+use std::io::Read;
 use std::path::Path;
-// use std::io;
-// use std::os::unix::io::RawFd;
 use termios::*;
+
+mod instruction;
+use instruction::Instruction;
+use instruction::Opcode;
 
 enum Registers {
     R0 = 0,
@@ -21,64 +19,70 @@ enum Registers {
     _R5,
     _R6,
     R7,
-    PC,     /* program counter */
-    COND,
+    PC, /* program counter */
     COUNT,
 }
 
-enum ConditionFlags {
-    POS = 1 << 0,   /* P */
-    ZRO = 1 << 1,   /* Z */
-    NEG = 1 << 2,   /* N */
+pub struct Flags {
+    n: bool,
+    z: bool,
+    p: bool,
 }
 
-/* These variables are of type 'Opcodes', which
- * will require a cast every single goddamn time.
- * Like that isn't enough, match won't let me cast
- * them easily; I have to do it in an extra if
- * clause. *sigh*
- */
-enum Opcodes {
-    BR = 0, /* branch */
-    ADD,    /* add  */
-    LD,     /* load */
-    ST,     /* store */
-    JSR,    /* jump register */
-    AND,    /* bitwise and */
-    LDR,    /* load register */
-    STR,    /* store register */
-    RTI,    /* unused */
-    NOT,    /* bitwise not */
-    LDI,    /* load indirect */
-    STI,    /* store indirect */
-    JMP,    /* jump */
-    RES,    /* reserved (unused) */
-    LEA,    /* load effective address */
-    TRAP,   /* execute trap */
-}
-
-enum TrapCodes {
-    GETC = 0x20,  /* get character from keyboard */
-    OUT = 0x21,   /* output a character */
-    PUTS = 0x22,  /* output a word string */
-    IN = 0x23,    /* input a string */
-    PUTSP = 0x24, /* output a byte string */
-    HALT = 0x25,  /* halt the program */
-}
-
-fn sign_extend(x: u16, bit_count: u16) -> u16{
-    if (x >> (bit_count - 1)) & 1 != 0 {
-        return x | (0xffff << bit_count);
+impl Flags {
+    pub fn update(&mut self, reg: u16) {
+        match reg {
+            0x0000 => {
+                self.n = false;
+                self.z = true;
+                self.p = false;
+            }
+            0x0001..=0x7fff => {
+                self.n = false;
+                self.p = true;
+                self.z = false;
+            }
+            0x8000..=0xffff => {
+                self.n = true;
+                self.p = false;
+                self.z = false;
+            }
+        };
     }
-    x
 }
 
-fn update_flags(regs_ref: &mut [u16], r: usize) {
-    regs_ref[Registers::COND as usize] =  match regs_ref[r] {
-        0                   => ConditionFlags::ZRO as u16,
-        r if r >> 15 == 1   => ConditionFlags::NEG as u16,
-        _                   => ConditionFlags::POS as u16,
-    };
+impl From<u8> for Flags {
+    fn from(flags: u8) -> Flags {
+        Flags {
+            n: ((flags & 0b100) >> 2) == 1,
+            z: ((flags & 0b010) >> 1) == 1,
+            p: (flags & 0b001) == 1,
+        }
+    }
+}
+
+enum TrapCode {
+    Getc(),  /* get character from keyboard */
+    Out(),   /* output a character */
+    Puts(),  /* output a word string */
+    In(),    /* input a string */
+    Putsp(), /* output a byte string */
+    Halt(),  /* halt the program */
+    Unknown(),
+}
+
+impl From<u8> for TrapCode {
+    fn from(vector: u8) -> TrapCode {
+        match vector {
+            0x20 => TrapCode::Getc(),
+            0x21 => TrapCode::Out(),
+            0x22 => TrapCode::Puts(),
+            0x23 => TrapCode::In(),
+            0x24 => TrapCode::Putsp(),
+            0x25 => TrapCode::Halt(),
+            _ => TrapCode::Unknown(),
+        }
+    }
 }
 
 enum MemoryMappedRegisters {
@@ -109,30 +113,26 @@ fn abort() {
     std::process::exit(1);
 }
 
-// fn swap16(x: u16) -> u16 {
-//     x << 8 | x >> 8
-// }
-
 fn get16(mem: &[u8], ind: usize) -> u16 {
-    ((mem[ind] as u16) << 8) + mem[ind+1] as u16
+    ((mem[ind] as u16) << 8) + mem[ind + 1] as u16
 }
 
 // https://doc.rust-lang.org/rust-by-example/std_misc/file/open.html
 fn read_image(mem: &mut [u16], image_path: &str) -> u32 {
     let path = Path::new(image_path);
-     // println!("[*] Loading {}", path.to_str().unwrap());
+    // println!("[*] Loading {}", path.to_str().unwrap());
     let mut file = File::open(&path).expect("Couldn't open file.");
 
     const SIZE: u32 = std::u16::MAX as u32 * 2 - 2;
     let mut mem_buffer: [u8; SIZE as usize] = [0; SIZE as usize];
     file.read(&mut mem_buffer).expect("Couldn't read file.");
     let length = file.metadata().unwrap().len();
-     // println!("[*] File length {}", length);
+    // println!("[*] File length {}", length);
 
     let base = get16(&mem_buffer, 0) as usize;
     for i in (2..length).step_by(2) {
         // println!("{}",i);
-        mem[base+(i/2 - 1) as usize] = get16(&mem_buffer, i as usize);
+        mem[base + (i / 2 - 1) as usize] = get16(&mem_buffer, i as usize);
     }
     // println!("{:?}", &mem[0x3000..0x4000]);
     length as u32
@@ -140,7 +140,7 @@ fn read_image(mem: &mut [u16], image_path: &str) -> u32 {
 
 fn run(args: &Vec<String>) {
     // Define and initialize the memory
-    let mut memory: [u16; std::u16::MAX as usize]  = [0; std::u16::MAX as usize];
+    let mut memory: [u16; std::u16::MAX as usize] = [0; std::u16::MAX as usize];
     // println!("{:?}", &memory[..]);
 
     for image in args.iter().skip(1) {
@@ -149,6 +149,7 @@ fn run(args: &Vec<String>) {
 
     // Define and initialize registers
     let mut regs: [u16; Registers::COUNT as usize] = [0; Registers::COUNT as usize];
+    let mut flags = Flags::from(0);
     // println!("{:?}", &_regs[..]);
 
     // Set the PC
@@ -157,167 +158,103 @@ fn run(args: &Vec<String>) {
 
     let mut running: bool = true;
     while running {
-        let instruction: u16 = mem_read(&mut memory, regs[Registers::PC as usize]);
+        let opcode = Opcode::from(mem_read(&mut memory, regs[Registers::PC as usize]));
+        // println!("[*] {:0b}", opcode.raw_value());
+        let instruction = Instruction::new(opcode).unwrap();
         regs[Registers::PC as usize] += 1;
-         // println!("[*] PC@0x{:x}", regs[Registers::PC as usize]);
-        let op: u16 = instruction >> 12;
+        // println!("[*] PC@0x{:x}", regs[Registers::PC as usize]);
+        // println!("[*] {:?}", instruction);
 
-        match op {
+        match instruction {
             // BRANCH
-            _ if op == Opcodes::BR  as u16  => {
-                let pc_offset: u16 = sign_extend(instruction & 0x1ff, 9);
-                let cond_flag: u16 = instruction >> 9 & 0b111;
-                 // println!("[*] BR {} {}", pc_offset, cond_flag);
-
-                if cond_flag & regs[Registers::COND as usize] != 0 {
-                    regs[Registers::PC as usize] += pc_offset;
+            Instruction::Br(n, z, p, offset) => {
+                if (n & flags.n) || (z & flags.z) || (p & flags.p) {
+                    regs[Registers::PC as usize] += offset;
                 }
-
-            },
+            }
             // ADD
-            _ if op == Opcodes::ADD as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize; /* DST */
-                let r1: usize = (instruction >> 6 & 0b111) as usize; /* SRC */
-                let imm_flag: u16 = instruction >> 5 & 0b1;          /* Immediate mode flag */
-                 // println!("[*] ADD {} {} {}", r0, r1, imm_flag);
-
-                if imm_flag == 1 {
-                    let imm5 = sign_extend(instruction & 0b11111, 5);
-                    regs[r0] = regs[r1] + imm5;
-                } else {
-                    let r2: usize = (instruction & 0b111) as usize;
-                    regs[r0] = regs[r1] + regs[r2];
-                }
-
-                update_flags(&mut regs, r0);
-
-            },
+            Instruction::AddReg(dr, sr1, sr2) => {
+                regs[dr] = regs[sr1] + regs[sr2];
+                flags.update(regs[dr]);
+            }
+            Instruction::AddImm(dr, sr1, imm5) => {
+                regs[dr] = regs[sr1] + (imm5 as u16);
+                flags.update(regs[dr]);
+            }
             // LOAD
-            _ if op == Opcodes::LD  as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let pc_offset: u16 = sign_extend(instruction & 0x1ff, 9);
-                 // println!("[*] LOAD {} {}", r0, pc_offset);
-
-                regs[r0] = mem_read(&mut memory, regs[Registers::PC as usize] + pc_offset);
-                update_flags(&mut regs, r0);
-
-            },
+            Instruction::Ld(dr, offset) => {
+                regs[dr] = mem_read(&mut memory, regs[Registers::PC as usize] + offset);
+                flags.update(regs[dr]);
+            }
             // STORE
-            _ if op == Opcodes::ST  as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let pc_offset: u16 = sign_extend(instruction & 0x1ff, 9);
-                 // println!("[*] STORE {} {}", r0, pc_offset);
-
-                mem_write(&mut memory, regs[Registers::PC as usize] + pc_offset, regs[r0]);
-
-            },
+            Instruction::St(sr, offset) => {
+                mem_write(&mut memory, regs[Registers::PC as usize] + offset, regs[sr]);
+            }
             // JUMP REGISTER
-            _ if op == Opcodes::JSR as u16  => {
-                let r1: usize = (instruction >> 6 & 0b111) as usize;
-                let long_pc_offset: u16 = sign_extend(instruction & 0x7ff, 11);
-                let long_flag: u16 = instruction >> 11 & 1;
-                 // println!("[*] JUMP {} {} {}", r1, long_pc_offset, long_flag);
-
+            Instruction::Jsr(offset) => {
                 regs[Registers::R7 as usize] = regs[Registers::PC as usize];
-                if long_flag != 0 {
-                    regs[Registers::PC as usize] += long_pc_offset;
-                } else {
-                    regs[Registers::PC as usize] = regs[r1];
-                }
-                
-            },
+                regs[Registers::PC as usize] += offset;
+            }
+            Instruction::Jsrr(base_r) => {
+                regs[Registers::R7 as usize] = regs[Registers::PC as usize];
+                regs[Registers::PC as usize] = regs[base_r];
+            }
             // BITWISE AND
-            _ if op == Opcodes::AND as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let r1: usize = (instruction >> 6 & 0b111) as usize;
-                let imm_flag: u16 = instruction >> 5 & 0b1;
-                 // println!("[*] AND {} {} {}", r0, r1, imm_flag);
-
-                if imm_flag == 1 {
-                    let imm5: u16 = sign_extend(instruction & 0x1f, 5);
-                    regs[r0] = regs[r1] & imm5;
-                } else {
-                    let r2: usize = (instruction & 0b111) as usize;
-                    regs[r0] = regs[r1] & regs[r2];
-                }
-                update_flags(&mut regs, r0);
-
-            },
+            Instruction::AndReg(dr, sr1, sr2) => {
+                regs[dr] = regs[sr1] & regs[sr2];
+                flags.update(regs[dr]);
+            }
+            Instruction::AndImm(dr, sr1, imm) => {
+                regs[dr] = regs[sr1] & (imm as u16);
+                flags.update(regs[dr]);
+            }
             // LOAD REGISTER
-            _ if op == Opcodes::LDR as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let r1: usize = (instruction >> 6 & 0b111) as usize;
-                let offset: u16 = sign_extend(instruction & 0x3f, 6);
-                 // println!("[*] LDR {} {} {}", r0, r1, offset);
-
-                regs[r0] = mem_read(&mut memory, regs[r1] + offset);
-                update_flags(&mut regs, r0);
-
-            },
+            Instruction::Ldr(dr, base_r, offset) => {
+                regs[dr] = mem_read(&mut memory, regs[base_r] + offset);
+                flags.update(regs[dr]);
+            }
             // STORE REGISTER
-            _ if op == Opcodes::STR as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let r1: usize = (instruction >> 6 & 0b111) as usize;
-                let offset: u16 = sign_extend(instruction & 0x3f, 6);
-                 // println!("[*] STR {} {} {}", r0, r1 ,offset);
-
-                mem_write(&mut memory, regs[r1] + offset, regs[r0]);
-
-            },
-            _ if op == Opcodes::RTI as u16  => {
-                 // println!("[*] BAD OPCODE(RTI)");
+            Instruction::Str(dr, base_r, offset) => {
+                mem_write(&mut memory, regs[base_r] + offset, regs[dr]);
+            }
+            Instruction::Rti() => {
+                // println!("[*] BAD OPCODE(RTI)");
                 abort();
-            },
+            }
             // BITWISE NOT
-            _ if op == Opcodes::NOT as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let r1: usize = (instruction >> 6 & 0b111) as usize;
-                 // println!("[*] NOT {} {}", r0, r1);
-
-                regs[r0] = !regs[r1];
-                update_flags(&mut regs, r0);
-            },
+            Instruction::Not(dr, sr) => {
+                regs[dr] = !regs[sr];
+                flags.update(regs[dr]);
+            }
             // LOAD INDIRECT
-            _ if op == Opcodes::LDI as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let pc_offset: u16 = sign_extend(instruction & 0x1ff, 9);
-
-                let addr: u16 = mem_read(&mut memory, regs[Registers::PC as usize] + pc_offset);
-                 // println!("[*] LDI {} {} addr: {}", r0, pc_offset, addr);
-                regs[r0] = mem_read(&mut memory, addr);
-                update_flags(&mut regs, r0);
-            },
+            Instruction::Ldi(dr, offset) => {
+                let addr: u16 = mem_read(&mut memory, regs[Registers::PC as usize] + offset);
+                regs[dr] = mem_read(&mut memory, addr);
+                flags.update(regs[dr]);
+            }
             // STORE INDIRECT
-            _ if op == Opcodes::STI as u16  => {
-                 // println!("[*] BAD OPCODE(STI)");
+            Instruction::Sti(_sr, _offset) => {
+                // println!("[*] BAD OPCODE(STI)");
                 abort();
-            },
+            }
             // JUMP
-            _ if op == Opcodes::JMP as u16  => {
-                let r1: usize = (instruction >> 6 & 0b111) as usize;
-                 // println!("[*] JMP {}", r1);
-                regs[Registers::PC as usize] = regs[r1];
-
-            },
+            Instruction::Jmp(base_r) => {
+                regs[Registers::PC as usize] = regs[base_r];
+            }
             // RESERVED(UNUSED)
-            _ if op == Opcodes::RES as u16  => {
-                 // println!("[*] RES");
-            },
+            Instruction::Reserved() => {
+                // println!("[*] RES");
+            }
             // LOAD EFFECTIVE ADDRESS
-            _ if op == Opcodes::LEA as u16  => {
-                let r0: usize = (instruction >> 9 & 0b111) as usize;
-                let pc_offset: u16 = sign_extend(instruction & 0x1ff, 9);
-                 // println!("[*] LEA {} {}", r0, pc_offset);
-
-                regs[r0] = regs[Registers::PC as usize] + pc_offset;
-                update_flags(&mut regs, r0);
-
-            },
+            Instruction::Lea(dr, offset) => {
+                regs[dr] = regs[Registers::PC as usize] + offset;
+                flags.update(regs[dr]);
+            }
             // TRAP
-            _ if op == Opcodes::TRAP as u16 => {
-                match instruction & 0xff {
+            Instruction::Trap(trap_vector) => {
+                match TrapCode::from(trap_vector) {
                     // GET CHARACTER FROM KEYBOARD
-                    _ if instruction & 0xff == TrapCodes::GETC as u16  => {
+                    TrapCode::Getc() => {
                         // https://stackoverflow.com/questions/30678953/how-to-read-a-single-character-from-input-as-u8
                         // regs[Registers::R0 as usize] = std::io::stdin()
                         //     .bytes()
@@ -329,16 +266,16 @@ fn run(args: &Vec<String>) {
                         std::io::stdin().read_exact(&mut buffer).unwrap();
                         regs[Registers::R0 as usize] = buffer[0] as u16;
                         // println!("[*] GETC");
-                    },
+                    }
                     // OUTPUT A CHARACTER
-                    _ if instruction & 0xff == TrapCodes::OUT  as u16  => {
+                    TrapCode::Out() => {
                         let c = regs[Registers::R0 as usize] as u8;
                         print!("{}", c as char);
-                         // println!("[*] OUT");
-                    },
+                        // println!("[*] OUT");
+                    }
                     // OUTPUT A STRING
-                    _ if instruction & 0xff == TrapCodes::PUTS as u16  => {
-                         // println!("[*] PUTS");
+                    TrapCode::Puts() => {
+                        // println!("[*] PUTS");
                         for c in &memory[regs[Registers::R0 as usize] as usize..] {
                             let c8 = (c & 0xff) as u8;
                             if c8 != 0x00 {
@@ -347,9 +284,9 @@ fn run(args: &Vec<String>) {
                                 break;
                             }
                         }
-                    },
+                    }
                     // INPUT A STRING
-                    _ if instruction & 0xff == TrapCodes::IN   as u16  => {
+                    TrapCode::In() => {
                         print!("Enter a character: ");
                         regs[Registers::R0 as usize] = std::io::stdin()
                             .bytes()
@@ -357,48 +294,44 @@ fn run(args: &Vec<String>) {
                             .and_then(|result| result.ok())
                             .map(|byte| byte as u16)
                             .unwrap();
-                         // println!("[*] IN");
-                    },
+                        // println!("[*] IN");
+                    }
                     // OUTPUT A BYTE STRING
-                    _ if instruction & 0xff == TrapCodes::PUTSP as u16 => {
+                    TrapCode::Putsp() => {
                         for c in &memory[regs[Registers::R0 as usize] as usize..] {
                             let b1 = (*c >> 8) as u8;
                             let b2 = (*c & 0xff) as u8;
-                            if b1!= 0 {
+                            if b1 != 0 {
                                 print!("{}", b1 as char);
                                 if b2 != 0 {
                                     print!("{}", b2 as char);
                                 }
                             }
                         }
-                         // println!("[*] PUTSP");
-                    },
+                        // println!("[*] PUTSP");
+                    }
                     // HALT THE PROGRAM
-                    _ if instruction & 0xff == TrapCodes::HALT  as u16 => {
+                    TrapCode::Halt() => {
                         println!("[!] HALT");
                         running = false;
-                    },
-                    _ => {
+                    }
+                    TrapCode::Unknown() => {
                         println!("[!] UNKNOWN TRAPCODE");
                         abort();
-                    },
+                    }
                 }
-            },
-            _ => {
-                println!("[!] UNKNOWN OPCODE");
-                abort();
-            },
+            }
         }
     }
 }
 
 fn main() {
     // https://stackoverflow.com/questions/26321592/how-can-i-read-one-character-from-stdin-without-having-to-hit-enter
-    let stdin = 0; // couldn't get std::os::unix::io::FromRawFd to work 
+    let stdin = 0; // couldn't get std::os::unix::io::FromRawFd to work
                    // on /dev/stdin or /dev/tty
     let termios = Termios::from_fd(stdin).unwrap();
-    let mut new_termios = termios.clone();  // make a mutable copy of termios 
-                                            // that we will modify
+    let mut new_termios = termios.clone(); // make a mutable copy of termios
+                                           // that we will modify
     new_termios.c_iflag &= IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON;
     new_termios.c_lflag &= !(ICANON | ECHO); // no echo and canonical mode
     tcsetattr(stdin, TCSANOW, &mut new_termios).unwrap();
@@ -406,8 +339,8 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     run(&args);
 
-    tcsetattr(stdin, TCSANOW, & termios).unwrap();  // reset the stdin to 
-                                                // original termios data
+    tcsetattr(stdin, TCSANOW, &termios).unwrap(); // reset the stdin to
+                                                  // original termios data
 }
 
 #[cfg(test)]
